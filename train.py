@@ -22,10 +22,11 @@ GAMMA = 0.99
 GAE_LAMBDA = 0.95
 PPO_EPSILON = 0.2
 VALUE_LOSS_COEF = 0.5
-ENTROPY_COEF = 0.1
+ENTROPY_COEF = 0.15
+TRANSITION_LOSS_COEF = 0.1
 MAX_GRAD_NORM = 0.5
-NUM_MINI_BATCHES = 1
-PPO_EPOCHS = 4
+NUM_MINI_BATCHES = 4
+PPO_EPOCHS = 10
 BATCH_SIZE = 256
 STEPS_PER_EPISODE = 2048
 NO_OF_EPISODES = 1000
@@ -58,8 +59,10 @@ class FrameStackEnv:
         return np.concatenate(list(self.frames), axis=0)
 
 class PerceptionComponent(nn.Module):
-    def __init__(self, input_shape):
+    def __init__(self, input_shape, num_heads=8):
         super(PerceptionComponent, self).__init__()
+        
+        
         self.conv = nn.Sequential(
             nn.Conv2d(input_shape[0] * FRAME_STACK, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -70,16 +73,27 @@ class PerceptionComponent(nn.Module):
             nn.Flatten()
         )
         
-        # Calculate the size of flattened features
         with torch.no_grad():
             sample_input = torch.zeros(1, input_shape[0] * FRAME_STACK, *input_shape[1:])
             self.feature_size = self.conv(sample_input).shape[1]
         
         self.fc = nn.Linear(self.feature_size, 512)
         
+        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=num_heads)
+        
     def forward(self, x):
         x = self.conv(x)
-        return self.fc(x)
+        
+        x = self.fc(x)  # Shape: (batch_size, 512)
+        
+        x = x.unsqueeze(0)  # Shape: (1, batch_size, 512)
+        
+        attn_output, _ = self.attention(x, x, x) # Shape: (1, batch_size, 512)
+        
+        attn_output = attn_output.squeeze(0)  # Shape: (batch_size, 512)
+        
+        return attn_output
+
 
 class ReactivePolicy(nn.Module):
     def __init__(self, input_size, discrete_action_dims):
@@ -102,18 +116,17 @@ class ReactivePolicy(nn.Module):
             self.discrete_action_heads[action_name] = nn.Linear(256, action_dim)
     
     def forward(self, x):
-        common_features = self.common_layers(x)
+        common_features = self.common_layers(x) # Shape: (batch_size, 256)
         
         discrete_action_logits = {}
         
         for action_name in self.discrete_action_dims.keys():
-            discrete_action_logits[action_name] = self.discrete_action_heads[action_name](common_features)
+            discrete_action_logits[action_name] = self.discrete_action_heads[action_name](common_features) # Shape: (batch_size, action_dim)
         
         return discrete_action_logits
 
     def sample_action(self, x):
         discrete_action_logits = self.forward(x)
-        
         discrete_actions = {}
         log_probs = {}
         
@@ -127,15 +140,15 @@ class ReactivePolicy(nn.Module):
 
     def evaluate_actions(self, x, discrete_actions):
         discrete_action_logits = self.forward(x)
-        
         log_probs = {}
         entropies = {}
         
         for action_name, logits in discrete_action_logits.items():
             dist = Categorical(logits=logits)
+            if len(discrete_actions[action_name].shape) > 1:
+                discrete_actions[action_name] = discrete_actions[action_name].squeeze(-1)
             log_probs[action_name] = dist.log_prob(discrete_actions[action_name])
             entropies[action_name] = dist.entropy()
-        
         return log_probs, entropies
 
 class ValueFunction(nn.Module):
@@ -144,21 +157,33 @@ class ValueFunction(nn.Module):
         self.fc = nn.Linear(input_size, 1)
         
     def forward(self, x):
-        return self.fc(x)
+        return self.fc(x) # Shape: (batch_size, 1)
 
 class TransitionModel(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, num_heads=4):
         super(TransitionModel, self).__init__()
+        
         self.fc = nn.Sequential(
             nn.Linear(state_dim + action_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, state_dim)
         )
         
+        self.attention = nn.MultiheadAttention(embed_dim=256, num_heads=num_heads)
+        
+        self.fc_out = nn.Linear(256, state_dim)
+        
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.fc(x)
-
+        x = torch.cat([state, action.unsqueeze(-1)], dim=-1)  # Shape: (batch_size, state_dim + action_dim)
+        
+        x = self.fc(x)  # Shape: (batch_size, 256)
+        
+        x = x.unsqueeze(0)  # Shape: (1, batch_size, 256)
+        
+        attn_output, _ = self.attention(x, x, x) # Shape: (1, batch_size, 256)
+        
+        attn_output = attn_output.squeeze(0)  # Shape: (batch_size, 256)
+        
+        return self.fc_out(attn_output)
     
 class FortniteAgent(nn.Module):
     def __init__(self, state_dim, discrete_action_dims):
@@ -199,11 +224,12 @@ class PPOAgent:
         with torch.no_grad():
             features = self.agent.perception(state)
             discrete_actions, _ = self.agent.policy.sample_action(features)
-        return discrete_actions
-
+            log_probs, _ = self.agent.policy.evaluate_actions(features, discrete_actions)
+        return discrete_actions, log_probs
+    
     def update(self):
         batch = list(self.memory)
-        states, discrete_actions, rewards, next_states = map(np.array, zip(*batch))
+        states, discrete_actions,old_log_probs, rewards, next_states = map(np.array, zip(*batch))
         
         states = torch.FloatTensor(states).to(device)
         
@@ -212,6 +238,8 @@ class PPOAgent:
         for i, action_name in enumerate(self.discrete_action_names):
             discrete_actions_dict[action_name] = torch.LongTensor(discrete_actions[:, i]).to(device)
 
+        old_log_probs_dict = {action_name: torch.FloatTensor([lp[action_name].item() for lp in old_log_probs]).to(device) 
+                          for action_name in self.discrete_action_names}
         rewards = torch.FloatTensor(rewards).to(device)
         next_states = torch.FloatTensor(next_states).to(device)
 
@@ -228,20 +256,18 @@ class PPOAgent:
             for indices in self.get_minibatch_indices():
                 mini_batch_states = states[indices]
                 mini_batch_discrete_actions = {k: v[indices].unsqueeze(-1) for k, v in discrete_actions_dict.items()}
+                mini_batch_old_log_probs = {k: v[indices] for k, v in old_log_probs_dict.items()}
                 mini_batch_advantages = advantages[indices]
                 mini_batch_returns = returns[indices]
                 mini_batch_values = values[indices]
 
                 features = self.agent.perception(mini_batch_states)
                 discrete_action_logits, new_values = self.agent(mini_batch_states)
-                
                 new_log_probs, entropies = self.agent.policy.evaluate_actions(features, mini_batch_discrete_actions)
-                old_log_probs, _ = self.agent.policy.evaluate_actions(features, mini_batch_discrete_actions)
-
-                ratio = torch.exp(sum(new_log_probs.values()) - sum(old_log_probs.values()))
+                ratio = torch.exp(sum(new_log_probs.values()) - sum(mini_batch_old_log_probs.values()))
                 surr1 = ratio * mini_batch_advantages
                 surr2 = torch.clamp(ratio, 1 - PPO_EPSILON, 1 + PPO_EPSILON) * mini_batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
+                actor_loss = -torch.min(surr1, surr2).mean()    
 
                 value_loss = nn.MSELoss()(new_values, mini_batch_returns)
 
@@ -251,7 +277,7 @@ class PPOAgent:
                 predicted_next_states = self.agent.predict_next_state(mini_batch_states, mini_batch_discrete_actions)
                 transition_loss = nn.MSELoss()(predicted_next_states, self.agent.perception(next_states[indices]))
 
-                loss = actor_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy + 0.1 * transition_loss
+                loss = actor_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy + TRANSITION_LOSS_COEF * transition_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -285,7 +311,7 @@ def train(env, agent):
     for _ in range(NO_OF_EPISODES):
         for _ in range(STEPS_PER_EPISODE):
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            discrete_actions = agent.select_action(state_tensor)
+            discrete_actions , log_probs = agent.select_action(state_tensor)
             # print("discretetete",discrete_actions)
             # Convert actions to numpy arrays for the environment
             discrete_actions_np = {k: v.cpu().numpy().squeeze() for k, v in discrete_actions.items()}
@@ -298,7 +324,7 @@ def train(env, agent):
             # Flatten the actions for storage in memory
             flat_discrete_actions = np.array([v for v in discrete_actions_np.values()])
             
-            agent.memory.append((state, flat_discrete_actions, reward, next_state))
+            agent.memory.append((state, flat_discrete_actions , log_probs, reward, next_state))
             episode_reward += reward
             state = next_state
 
@@ -327,6 +353,6 @@ discrete_action_dims = {'fire': 2}    # Binary fire action (fire or not fire)
 
 agent = PPOAgent(state_dim, discrete_action_dims)
 
-agent.agent.load_state_dict(torch.load('models/model15360.pth'))
+# agent.agent.load_state_dict(torch.load('models/model15360.pth'))
 
 train(env, agent)
