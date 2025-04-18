@@ -1,358 +1,351 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Categorical
 import numpy as np
-from collections import deque
-import random
-
-from fortnite_env import FortniteEnv
-from pushbullet import Pushbullet
-from dotenv import load_dotenv
-load_dotenv()
+import gymnasium as gym
+import time
 import os
+from fortnite_env import FortniteEnv, FrameStackEnv
 
-access_token = os.getenv("ACCESS_TOKEN")
-title = "GAME STOPPED GAME STOPPED GAME STOPPED"
-body = "GAME STOPPED GAME STOPPED GAME STOPPED"
+def run_env_and_save_data(env, num_steps, save_dir, policy=None):
+    """
+    Runs the given environment for a specified number of steps, collecting
+    observations, actions, rewards, and done flags, and saves these as
+    separate PyTorch tensors in chunks of 100, with a suffix.
 
-# Hyperparameters
-LEARNING_RATE = 1e-6
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-PPO_EPSILON = 0.2
-VALUE_LOSS_COEF = 0.5
-ENTROPY_COEF = 0.15
-TRANSITION_LOSS_COEF = 0.1
-MAX_GRAD_NORM = 0.5
-NUM_MINI_BATCHES = 4
-PPO_EPOCHS = 10
-BATCH_SIZE = 256
-STEPS_PER_EPISODE = 2048
-NO_OF_EPISODES = 1000
-FRAME_STACK = 4
+    Args:
+        env: The Gymnasium environment to run.
+        num_steps: The number of steps to run the environment for.
+        save_dir: The directory where the tensors will be saved.
+        policy: An optional function that takes the current observation and
+                returns an action. If None, random actions are used.
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    observations = []
+    actions = []
+    rewards = []
+    dones = []
+    obs, _ = env.reset()
+    time_now = time.time()
+    chunk_count = 101
+    for step in range(num_steps):
+        print(f"time in {step}: {time.time()-time_now}")
+        time_now = time.time()
+        if policy:
+            action = policy(obs)
+        else:
+            action = env.action_space.sample()
 
-class FrameStackEnv:
-    def __init__(self, env, num_stack):
-        self.env = env
-        self.num_stack = num_stack
-        self.frames = deque([], maxlen=num_stack)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
 
-    def reset(self):
-        obs, _ = self.env.reset()
-        for _ in range(self.num_stack):
-            self.frames.append(obs)
-        return self.get_obs(), {}
+        observations.append(obs)
+        action_tensor = torch.tensor([
+            action['fire'],
+            action['look_left_or_right_or_up_or_down'][0],
+            action['look_left_or_right_or_up_or_down'][1],
+            action['move'][0],
+            action['move'][1],
+            action['move'][2],
+            action['move'][3],
+            action['move'][4],
+            action['move'][5],
+        ])
+        actions.append(action_tensor)
+        rewards.append(reward)
+        dones.append(done)
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        if reward == 696969:
-            Pushbullet(access_token).push_note(title, body)
-            print("Ending environment")
-            exit()
-        self.frames.append(obs)
-        return self.get_obs(), reward, terminated, truncated, info
+        if done:
+            break
+        obs = next_obs
+        if step % 100 == 0:
+            print(f"Step: {step}/{num_steps}")
 
-    def get_obs(self):
-        return np.concatenate(list(self.frames), axis=0)
+        if (step + 1) % 100 == 0 or step == num_steps - 1 or done:
+            print(f"Saving data at step: {step + 1}")
+            obs_tensor = torch.tensor(np.array(observations))
+            act_tensor = torch.stack(actions)
+            rew_tensor = torch.tensor(rewards)
+            done_tensor = torch.tensor(dones)
 
-class PerceptionComponent(nn.Module):
-    def __init__(self, input_shape, num_heads=8):
-        super(PerceptionComponent, self).__init__()
-        
-        
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0] * FRAME_STACK, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        
-        with torch.no_grad():
-            sample_input = torch.zeros(1, input_shape[0] * FRAME_STACK, *input_shape[1:])
-            self.feature_size = self.conv(sample_input).shape[1]
-        
-        self.fc = nn.Linear(self.feature_size, 512)
-        
-        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=num_heads)
-        
-    def forward(self, x):
-        x = self.conv(x)
-        
-        x = self.fc(x)  # Shape: (batch_size, 512)
-        
-        x = x.unsqueeze(0)  # Shape: (1, batch_size, 512)
-        
-        attn_output, _ = self.attention(x, x, x) # Shape: (1, batch_size, 512)
-        
-        attn_output = attn_output.squeeze(0)  # Shape: (batch_size, 512)
-        
-        return attn_output
+            chunk_count += 1
+            obs_path = os.path.join(save_dir, f'observations_{chunk_count}.pt')
+            act_path = os.path.join(save_dir, f'actions_{chunk_count}.pt')
+            rew_path = os.path.join(save_dir, f'rewards_{chunk_count}.pt')
+            done_path = os.path.join(save_dir, f'dones_{chunk_count}.pt')
 
+            torch.save(obs_tensor, obs_path)
+            torch.save(act_tensor, act_path)
+            torch.save(rew_tensor, rew_path)
+            torch.save(done_tensor, done_path)
 
-class ReactivePolicy(nn.Module):
-    def __init__(self, input_size, discrete_action_dims):
-        super(ReactivePolicy, self).__init__()
-        self.input_size = input_size
-        self.discrete_action_dims = discrete_action_dims
-        
-        # Common layers
-        self.common_layers = nn.Sequential(
-            nn.Linear(input_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU()
-        )
-        
-        # Discrete action heads
-        self.discrete_action_heads = nn.ModuleDict()
-        
-        for action_name, action_dim in discrete_action_dims.items():
-            self.discrete_action_heads[action_name] = nn.Linear(256, action_dim)
-    
-    def forward(self, x):
-        common_features = self.common_layers(x) # Shape: (batch_size, 256)
-        
-        discrete_action_logits = {}
-        
-        for action_name in self.discrete_action_dims.keys():
-            discrete_action_logits[action_name] = self.discrete_action_heads[action_name](common_features) # Shape: (batch_size, action_dim)
-        
-        return discrete_action_logits
+            observations = []
+            actions = []
+            rewards = []
+            dones = []
+    print(f"Saved environment data to {save_dir}")
 
-    def sample_action(self, x):
-        discrete_action_logits = self.forward(x)
-        discrete_actions = {}
-        log_probs = {}
-        
-        for action_name, logits in discrete_action_logits.items():
-            dist = Categorical(logits=logits)
-            action = dist.sample()
-            discrete_actions[action_name] = action
-            log_probs[action_name] = dist.log_prob(action)
-        
-        return discrete_actions, log_probs
+def random_policy(obs):
+    return {"fire" : np.random.uniform(-1, 1),
+            "look_left_or_right_or_up_or_down" : (np.random.uniform(-1, 1),np.random.uniform(-0.005,0.005)),
+            "move": tuple(np.random.uniform(-1, 1) for i in range(6))
+            }
 
-    def evaluate_actions(self, x, discrete_actions):
-        discrete_action_logits = self.forward(x)
-        log_probs = {}
-        entropies = {}
-        
-        for action_name, logits in discrete_action_logits.items():
-            dist = Categorical(logits=logits)
-            if len(discrete_actions[action_name].shape) > 1:
-                discrete_actions[action_name] = discrete_actions[action_name].squeeze(-1)
-            log_probs[action_name] = dist.log_prob(discrete_actions[action_name])
-            entropies[action_name] = dist.entropy()
-        return log_probs, entropies
+env = FrameStackEnv(FortniteEnv(),1)
+run_env_and_save_data(env, 100000, 'world_model_data', random_policy)
 
-class ValueFunction(nn.Module):
-    def __init__(self, input_size):
-        super(ValueFunction, self).__init__()
-        self.fc = nn.Linear(input_size, 1)
-        
-    def forward(self, x):
-        return self.fc(x) # Shape: (batch_size, 1)
+# import numpy as np
+# import torch
+# from collections import deque
+# import os
+# import json
+# from typing import Callable, Dict, List, Optional
+# import gymnasium as gym
+# import time
+# from fortnite_env import FortniteEnv, FrameStackEnv
 
-class TransitionModel(nn.Module):
-    def __init__(self, state_dim, action_dim, num_heads=4):
-        super(TransitionModel, self).__init__()
-        
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-        )
-        
-        self.attention = nn.MultiheadAttention(embed_dim=256, num_heads=num_heads)
-        
-        self.fc_out = nn.Linear(256, state_dim)
-        
-    def forward(self, state, action):
-        x = torch.cat([state, action.unsqueeze(-1)], dim=-1)  # Shape: (batch_size, state_dim + action_dim)
-        
-        x = self.fc(x)  # Shape: (batch_size, 256)
-        
-        x = x.unsqueeze(0)  # Shape: (1, batch_size, 256)
-        
-        attn_output, _ = self.attention(x, x, x) # Shape: (1, batch_size, 256)
-        
-        attn_output = attn_output.squeeze(0)  # Shape: (batch_size, 256)
-        
-        return self.fc_out(attn_output)
-    
-class FortniteAgent(nn.Module):
-    def __init__(self, state_dim, discrete_action_dims):
-        super(FortniteAgent, self).__init__()
-        self.perception = PerceptionComponent(state_dim)
-        self.policy = ReactivePolicy(512, discrete_action_dims)
-        self.value = ValueFunction(512)
-        total_action_dim = sum([1 for v in discrete_action_dims.keys()])
-        self.transition_model = TransitionModel(512, total_action_dim)
-        
-    def forward(self, state):
-        features = self.perception(state)
-        discrete_action_logits = self.policy(features)
-        value = self.value(features)
-        return discrete_action_logits, value
-    
-    def predict_next_state(self, state, discrete_actions):
-        features = self.perception(state)
-        # print(discrete_actions)
-        # Convert discrete actions to float and concatenate
-        discrete_part = torch.cat([action.float().unsqueeze(-1) for action in discrete_actions.values()], dim=-1)
-        
-        # Use discrete actions only
-        action = discrete_part.squeeze(-1)
-        # print(action.shape)
-        
-        return self.transition_model(features, action)
-    
-class PPOAgent:
-    def __init__(self, state_dim, discrete_action_dims):
-        self.agent = FortniteAgent(state_dim, discrete_action_dims).to(device)
-        self.optimizer = optim.Adam(self.agent.parameters(), lr=LEARNING_RATE)
-        self.memory = deque(maxlen=BATCH_SIZE)
-        self.discrete_action_dims = discrete_action_dims
-        self.discrete_action_names = list(discrete_action_dims.keys())
+# import numpy as np
+# import torch
+# from collections import deque
+# import os
+# import json
+# from typing import Callable, Dict, List, Optional
+# import gymnasium as gym
+# import sys
+# # Add the path for import
+# sys.path.append(r"C:\Users\Tushar\Projects\ML\DSG\RL_MINE\dreamer\Cosmos-Tokenizer")
 
-    def select_action(self, state):
-        with torch.no_grad():
-            features = self.agent.perception(state)
-            discrete_actions, _ = self.agent.policy.sample_action(features)
-            log_probs, _ = self.agent.policy.evaluate_actions(features, discrete_actions)
-        return discrete_actions, log_probs
-    
-    def update(self):
-        batch = list(self.memory)
-        states, discrete_actions,old_log_probs, rewards, next_states = map(np.array, zip(*batch))
-        
-        states = torch.FloatTensor(states).to(device)
-        
-        # Handle discrete actions
-        discrete_actions_dict = {}
-        for i, action_name in enumerate(self.discrete_action_names):
-            discrete_actions_dict[action_name] = torch.LongTensor(discrete_actions[:, i]).to(device)
+# # Import the required class
+# from cosmos_tokenizer.image_lib import ImageTokenizer
 
-        old_log_probs_dict = {action_name: torch.FloatTensor([lp[action_name].item() for lp in old_log_probs]).to(device) 
-                          for action_name in self.discrete_action_names}
-        rewards = torch.FloatTensor(rewards).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
+# # Remove the added path to return to original state
+# sys.path.remove(r"C:\Users\Tushar\Projects\ML\DSG\RL_MINE\dreamer\Cosmos-Tokenizer")
 
-        with torch.no_grad():
-            _, values = self.agent(states)
-            _, next_values = self.agent(next_states)
+# class TokenizedWorldModelExplorer:
+#     def __init__(self, encoder_checkpoint: str, world_model: torch.nn.Module):
+#         self.encoder = ImageTokenizer(checkpoint_enc=encoder_checkpoint)
+#         self.world_model = world_model
+#         self.curiosity_buffer = deque(maxlen=1000)
+        
+#     def preprocess_observation(self, obs: np.ndarray) -> torch.Tensor:
+#         """Convert observation to tokenized representation"""
+#         # Convert numpy array to torch tensor and add batch dimension if needed
+#         if isinstance(obs, np.ndarray):
+#             obs = torch.from_numpy(obs).unsqueeze(0)
+        
+#         # Ensure correct shape and type
+#         obs = obs.to(torch.float32)
+#         if obs.shape[1] == 1:  # If grayscale
+#             obs = obs.repeat(1, 3, 1, 1)
             
-        advantages = self.compute_gae(rewards, values, next_values).to(device)
-        returns = advantages + values
-
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        for _ in range(PPO_EPOCHS):
-            for indices in self.get_minibatch_indices():
-                mini_batch_states = states[indices]
-                mini_batch_discrete_actions = {k: v[indices].unsqueeze(-1) for k, v in discrete_actions_dict.items()}
-                mini_batch_old_log_probs = {k: v[indices] for k, v in old_log_probs_dict.items()}
-                mini_batch_advantages = advantages[indices]
-                mini_batch_returns = returns[indices]
-                mini_batch_values = values[indices]
-
-                features = self.agent.perception(mini_batch_states)
-                discrete_action_logits, new_values = self.agent(mini_batch_states)
-                new_log_probs, entropies = self.agent.policy.evaluate_actions(features, mini_batch_discrete_actions)
-                ratio = torch.exp(sum(new_log_probs.values()) - sum(mini_batch_old_log_probs.values()))
-                surr1 = ratio * mini_batch_advantages
-                surr2 = torch.clamp(ratio, 1 - PPO_EPSILON, 1 + PPO_EPSILON) * mini_batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()    
-
-                value_loss = nn.MSELoss()(new_values, mini_batch_returns)
-
-                entropy = sum(entropies.values()).mean()
-
-                # Add transition model loss
-                predicted_next_states = self.agent.predict_next_state(mini_batch_states, mini_batch_discrete_actions)
-                transition_loss = nn.MSELoss()(predicted_next_states, self.agent.perception(next_states[indices]))
-
-                loss = actor_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy + TRANSITION_LOSS_COEF * transition_loss
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.parameters(), MAX_GRAD_NORM)
-                self.optimizer.step()
-
-        self.memory.clear()
-
-    def compute_gae(self, rewards, values, next_values):
-        gae = 0
-        advantages = []
-        for step in reversed(range(len(rewards))):
-            delta = rewards[step] + GAMMA * next_values[step] - values[step]
-            gae = delta + GAMMA * GAE_LAMBDA * gae
-            advantages.insert(0, gae)
-        return torch.tensor(advantages)
-
-    def get_minibatch_indices(self):
-        indices = np.arange(BATCH_SIZE)
-        np.random.shuffle(indices)
-        return np.array_split(indices, NUM_MINI_BATCHES)
+#         # Move to GPU if available
+#         device = next(self.world_model.parameters()).device
+#         obs = obs.to(device).to(torch.bfloat16)
+        
+#         # Get tokenized representation
+#         _, obs_enc_latent = self.encoder.encode(obs)
+#         return obs_enc_latent
     
-
-def train(env, agent):
-    state, _ = env.reset()
-    episode_reward = 0
-    episode_steps = 0
-    episode_count = 0
-    total_steps = 0
-
-    for _ in range(NO_OF_EPISODES):
-        for _ in range(STEPS_PER_EPISODE):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            discrete_actions , log_probs = agent.select_action(state_tensor)
-            # print("discretetete",discrete_actions)
-            # Convert actions to numpy arrays for the environment
-            discrete_actions_np = {k: v.cpu().numpy().squeeze() for k, v in discrete_actions.items()}
+#     def calculate_curiosity(self, obs: np.ndarray) -> float:
+#         """Calculate curiosity reward using tokenized representation"""
+#         with torch.no_grad():
+#             # Get tokenized representation
+#             obs_tokens = self.preprocess_observation(obs)
             
-            # Use discrete actions only for the environment step
-            combined_action = discrete_actions_np
+#             # Get world model prediction
+#             _, _, pred_tokens = self.world_model(obs_tokens)
             
-            next_state, reward, terminated, truncated, _ = env.step(combined_action)
+#             # Calculate prediction error in token space
+#             error = torch.mean((obs_tokens - pred_tokens)**2).item()
             
-            # Flatten the actions for storage in memory
-            flat_discrete_actions = np.array([v for v in discrete_actions_np.values()])
+#             # Store tokenized representation for novelty calculation
+#             self.curiosity_buffer.append(obs_tokens.cpu().numpy())
             
-            agent.memory.append((state, flat_discrete_actions , log_probs, reward, next_state))
-            episode_reward += reward
-            state = next_state
+#             # Calculate novelty bonus based on token-space distances
+#             if len(self.curiosity_buffer) > 0:
+#                 distances = [np.linalg.norm(obs_tokens.cpu().numpy() - buf_tokens) 
+#                            for buf_tokens in self.curiosity_buffer]
+#                 novelty = 1.0 / (1.0 + np.mean(distances))
+#             else:
+#                 novelty = 1.0
+                
+#             return error * novelty
 
-            total_steps += 1
-            episode_steps += 1
+# def run_env_and_save_data(env, num_steps: int, save_path: str, 
+#                          exploration_type: str = "curiosity",
+#                          policy: Optional[Callable] = None,
+#                          world_model: Optional[torch.nn.Module] = None,
+#                          encoder_checkpoint: Optional[str] = None):
+#     """
+#     Collects environment data with different exploration strategies
+#     optimized for sparse reward scenarios
+    
+#     Args:
+#         env: Fortnite-style environment with sparse rewards
+#         num_steps: Total steps to collect
+#         save_path: Directory to save collected data
+#         exploration_type: One of ["random", "ou_noise", "curiosity", "population"]
+#         policy: Existing policy network (for guided exploration)
+#         world_model: World model for curiosity-driven exploration
+#         encoder_checkpoint: Path to Cosmos tokenizer checkpoint
+#     """
+#     # Initialize buffers
+#     obs_buffer: List[np.ndarray] = []
+#     action_buffer: List[np.ndarray] = []
+#     reward_buffer: List[float] = []
+#     done_buffer: List[bool] = []
+#     info_buffer: List[Dict] = []
+    
+#     # Initialize exploration modules
+#     if exploration_type == "ou_noise":
+#         explorer = OUNoise(action_dim=env.action_space.shape[0])
+#     elif exploration_type == "curiosity":
+#         if world_model is None or encoder_checkpoint is None:
+#             raise ValueError("World model and encoder checkpoint required for curiosity exploration")
+#         explorer = TokenizedWorldModelExplorer(encoder_checkpoint, world_model)
+#         world_model.eval()
+#     elif exploration_type == "population":
+#         explorer = [OUNoise(action_dim=env.action_space.shape[0]) for _ in range(5)]
 
-            if len(agent.memory) == BATCH_SIZE:
-                print("Updating agent")
-                agent.update()
-                agent.memory.clear()
-                torch.save(agent.agent.state_dict(), f'models/model{total_steps}.pth')
+#     # Tracking variables
+#     sparse_reward_counter = 0
+#     episode_data = {
+#         "states": [],
+#         "actions": [],
+#         "rewards": [],
+#         "intrinsic_rewards": []
+#     }
 
-            if terminated or truncated or episode_steps >= 1024:
-                print(f"Episode {episode_count}, Steps: {episode_steps}, Total Reward: {episode_reward}")
-                state, _ = env.reset()
-                episode_count += 1
-                episode_reward = 0
-                episode_steps = 0
+#     obs, _ = env.reset()
+#     total_steps = 0
+    
+#     while total_steps < num_steps:
+#         # Select action based on exploration strategy
+#         if exploration_type == "random":
+#             action = env.action_space.sample()
+#         elif exploration_type == "ou_noise":
+#             base_action = policy(obs) if policy else np.zeros(env.action_space.shape)
+#             noise = explorer.sample()
+#             action = np.clip(base_action + noise, -1, 1)
+#         elif exploration_type == "curiosity":
+#             intrinsic_reward = explorer.calculate_curiosity(obs)
+#             action = _guided_exploration(obs, intrinsic_reward, policy, env)
+#         elif exploration_type == "population":
+#             current_explorer = np.random.choice(explorer)
+#             action = current_explorer.sample()
+            
+#         # Environment step
+#         next_obs, reward, done, truncated, info = env.step(action)
+#         total_steps += 1
+        
+#         # Handle sparse rewards
+#         is_sparse_reward = reward != 0
+#         if is_sparse_reward:
+#             sparse_reward_counter += 1
+#             priority = 2.0
+#         else:
+#             priority = 0.5
+            
+#         # Store transition
+#         _store_transition(obs, action, reward, done, info, priority, episode_data)
+#         obs = next_obs
+        
+#         if done or truncated:
+#             _save_episode_data(save_path, episode_data, exploration_type)
+#             obs, _ = env.reset()
+#             episode_data = {"states": [], "actions": [], "rewards": [], "intrinsic_rewards": []}
+            
+#     # Save final data
+#     _save_dataset(save_path, obs_buffer, action_buffer, reward_buffer, done_buffer, info_buffer)
+#     if exploration_type == "curiosity":
+#         _save_exploration_metrics(save_path, sparse_reward_counter, total_steps, explorer.curiosity_buffer)
 
-# Initialize environment and agent
-env = FrameStackEnv(FortniteEnv(), FRAME_STACK)
-state_dim = env.env.observation_space.shape
 
-# Simplified action space
-discrete_action_dims = {'fire': 2}    # Binary fire action (fire or not fire)
+# class OUNoise:
+#     """Ornstein-Uhlenbeck process for exploration noise"""
+#     def __init__(self, action_dim: int, mu: float = 0, theta: float = 0.15, sigma: float = 0.2):
+#         self.mu = mu * np.ones(action_dim)
+#         self.theta = theta
+#         self.sigma = sigma
+#         self.state = np.copy(self.mu)
+        
+#     def reset(self):
+#         self.state = np.copy(self.mu)
+        
+#     def sample(self) -> np.ndarray:
+#         dx = self.theta * (self.mu - self.state)
+#         dx += self.sigma * np.random.randn(len(self.state))
+#         self.state += dx
+#         return self.state
 
-agent = PPOAgent(state_dim, discrete_action_dims)
+# def _calculate_curiosity(obs: np.ndarray, world_model: torch.nn.Module, buffer: deque) -> float:
+#     """Compute intrinsic reward using world model prediction error"""
+#     with torch.no_grad():
+#         obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+#         _, _, pred_obs = world_model(obs_tensor)
+#         error = torch.mean((obs_tensor - pred_obs)**2).item()
+    
+#     # Novelty bonus
+#     novelty = 1.0 / (1.0 + np.mean([np.linalg.norm(obs - buf_obs) for buf_obs in buffer]))
+#     buffer.append(obs)
+#     return error * novelty
 
-# agent.agent.load_state_dict(torch.load('models/model15360.pth'))
+# def _guided_exploration(obs: np.ndarray, intrinsic_reward: float, 
+#                        policy: Optional[Callable], env) -> np.ndarray:
+#     """Hybrid exploration using policy and intrinsic rewards"""
+#     if policy and np.random.rand() < 0.7:  # 70% policy guidance
+#         base_action = policy(obs)
+#         noise_scale = 0.3 * (1 - intrinsic_reward)
+#         return np.clip(
+#             base_action + noise_scale * np.random.randn(*base_action.shape),
+#             env.action_space.low,
+#             env.action_space.high
+#         )
+#     else:
+#         return env.action_space.sample()
 
-train(env, agent)
+
+# def _store_transition(obs: np.ndarray, action: np.ndarray, reward: float, done: bool, info: Dict, priority: float, episode_data: Dict):
+#     """Prioritized experience storage for sparse rewards"""
+#     episode_data["states"].append(obs)
+#     episode_data["actions"].append(action)
+#     episode_data["rewards"].append(reward)
+#     episode_data["intrinsic_rewards"].append(info.get("intrinsic_reward", 0))
+
+# def _save_episode_data(path: str, data: Dict, exploration_type: str):
+#     """Save episode data with exploration-specific metrics"""
+#     os.makedirs(path, exist_ok=True)
+#     episode_id = len(os.listdir(path))
+#     filename = f"{path}/{exploration_type}_episode_{episode_id}.npz"
+#     np.savez_compressed(
+#         filename,
+#         states=np.array(data["states"]),
+#         actions=np.array(data["actions"]),
+#         rewards=np.array(data["rewards"]),
+#         intrinsic_rewards=np.array(data["intrinsic_rewards"])
+#     )
+
+# def _save_dataset(path: str, *buffers):
+#     """Save final dataset in RL-friendly format"""
+#     dataset = {
+#         "observations": np.array(buffers[0]),
+#         "actions": np.array(buffers[1]),
+#         "rewards": np.array(buffers[2]),
+#         "dones": np.array(buffers[3]),
+#         "infos": buffers[4]
+#     }
+#     np.savez_compressed(f"{path}/full_dataset.npz", **dataset)
+
+# def _save_exploration_metrics(path: str, sparse_rewards: int, total_steps: int, curiosity_buffer: deque):
+#     """Log exploration effectiveness metrics"""
+#     metrics = {
+#         "sparse_reward_rate": sparse_rewards / total_steps,
+#         "states_visited": len(curiosity_buffer),
+#         "exploration_coverage": len(curiosity_buffer) / total_steps
+#     }
+#     with open(f"{path}/exploration_metrics.json", "w") as f:
+#         json.dump(metrics, f)
+
+# # Example usage
+# env = FrameStackEnv(FortniteEnv(), 1)
+# run_env_and_save_data(env, 10000, 'world_model_data', exploration_type="curiosity")
