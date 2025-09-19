@@ -1,6 +1,6 @@
 # FortnAI
 
-Watch the Demo
+**Watch the Demo:**
 [![Watch the Demo](https://img.youtube.com/vi/wSUpo9QFcRs/default.jpg)](https://youtu.be/wSUpo9QFcRs)
 
 A reinforcement learning agent that learns directly from screen capture in Fortnite, implemented with DreamerV3 and computer vision.
